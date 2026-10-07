@@ -104,16 +104,17 @@ func (c VerificationCase) CurrentBaseline() Baseline {
 	return Baseline(c.Version)
 }
 
-// CheckBaseline reports whether a submission may be applied to the case. The
-// check rejects a submission that references a case state the service has not
-// reached yet and accepts everything else.
+// CheckBaseline reports whether a submission may be applied to the case. A
+// submission that carries a baseline is applied only while the baseline still
+// matches the case version exactly; a stale baseline and one the service has
+// not reached yet are both rejected.
 func (c VerificationCase) CheckBaseline(baseline Baseline) error {
 	if !baseline.Provided() {
 		return nil
 	}
-	if baseline.Count() > c.Version {
+	if baseline.Count() != c.Version {
 		return fmt.Errorf(
-			"%w: submission carries %s but the case is at %d",
+			"%w: submission carries %s but the case is at version %d",
 			ErrStateConflict,
 			baseline.Describe(),
 			c.Version,
