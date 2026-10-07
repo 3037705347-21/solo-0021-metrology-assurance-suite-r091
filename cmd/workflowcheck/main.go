@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"handling-baseline":        checkHandlingBaseline,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,402 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkHandlingBaseline() error {
+	if err := checkStaleMeasurementBaseline(); err != nil {
+		return fmt.Errorf("stale measurement: %w", err)
+	}
+	if err := checkStaleReopenBaseline(); err != nil {
+		return fmt.Errorf("stale reopen: %w", err)
+	}
+	if err := checkStaleSealBaseline(); err != nil {
+		return fmt.Errorf("stale seal: %w", err)
+	}
+	if err := checkConcurrentBaselineSeal(); err != nil {
+		return fmt.Errorf("concurrent seal: %w", err)
+	}
+	if err := checkConcurrentBaselineMeasurement(); err != nil {
+		return fmt.Errorf("concurrent measurement: %w", err)
+	}
+	return nil
+}
+
+// checkStaleMeasurementBaseline races two technicians over one case. The
+// colleague who commits first advances the count; the technician holding the
+// older page must be rejected, and the rejection must leave no measurement,
+// case change, or audit event behind.
+func checkStaleMeasurementBaseline() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	if err := expectVersion(opened, 1); err != nil {
+		return err
+	}
+
+	first, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
+		"observed":   25.2,
+		"technician": "Rui",
+		"baseline":   1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectVersion(first, 2); err != nil {
+		return err
+	}
+
+	stale, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
+		"observed":   25.3,
+		"technician": "Tao",
+		"baseline":   1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stale, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(stale, "state_conflict"); err != nil {
+		return err
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectVersion(read, 2); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("case state after stale submission = %q", state)
+	}
+	measurements, err := nestedSlice(read.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 1 {
+		return fmt.Errorf("stale submission left %d measurements", len(measurements))
+	}
+	events, err := nestedSlice(read.Body, "events")
+	if err != nil {
+		return err
+	}
+	if len(events) != 2 {
+		return fmt.Errorf("stale submission left %d audit events", len(events))
+	}
+	if hasEvent(read.Body, "measurement_rejected") {
+		return errors.New("stale submission appended a measurement event")
+	}
+	return nil
+}
+
+// checkStaleReopenBaseline verifies that a reopen carrying an old or a future
+// count is rejected without touching the case or its history.
+func checkStaleReopenBaseline() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.rejectedCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":    "Lin",
+		"reason":   "measurement setup was replaced",
+		"baseline": 2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectVersion(reopened, 3); err != nil {
+		return err
+	}
+
+	for _, baseline := range []int{2, 9} {
+		stale, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+			"actor":    "Lin",
+			"reason":   "stale reopen attempt",
+			"baseline": baseline,
+		})
+		if err != nil {
+			return err
+		}
+		if err := expectStatus(stale, http.StatusConflict); err != nil {
+			return err
+		}
+		if err := expectErrorCode(stale, "state_conflict"); err != nil {
+			return err
+		}
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectVersion(read, 3); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("case state after stale reopen = %q", state)
+	}
+	measurements, err := nestedSlice(read.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 1 {
+		return fmt.Errorf("stale reopen changed measurement history: %d entries", len(measurements))
+	}
+	events, err := nestedSlice(read.Body, "events")
+	if err != nil {
+		return err
+	}
+	reopenEvents := 0
+	for _, entry := range events {
+		event, ok := entry.(map[string]any)
+		if ok && event["kind"] == "case_reopened" {
+			reopenEvents++
+		}
+	}
+	if reopenEvents != 1 {
+		return fmt.Errorf("stale reopen left %d reopen events", reopenEvents)
+	}
+	return nil
+}
+
+// checkStaleSealBaseline verifies that sealing from an old page is rejected,
+// only the current count seals the case, and a second seal afterwards never
+// creates another evidence seal.
+func checkStaleSealBaseline() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1503")
+	if err != nil {
+		return err
+	}
+
+	stale, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-Old",
+		"summary":  "sealed from an old page",
+		"baseline": 1,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stale, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(stale, "state_conflict"); err != nil {
+		return err
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectVersion(read, 2); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("case state after stale seal = %q", state)
+	}
+	if _, exists := read.Body["seal"]; exists {
+		return errors.New("stale seal created an evidence seal")
+	}
+	if hasEvent(read.Body, "case_sealed") {
+		return errors.New("stale seal appended a seal event")
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-Current",
+		"summary":  "sealed from the current page",
+		"baseline": 2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectVersion(sealed, 3); err != nil {
+		return err
+	}
+
+	after, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Reviewer-Late",
+		"summary":  "sealed again from an old page",
+		"baseline": 2,
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(after, http.StatusConflict); err != nil {
+		return err
+	}
+
+	final, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	sealID, err := nestedString(final.Body, "seal", "id")
+	if err != nil {
+		return err
+	}
+	if sealID == "" {
+		return errors.New("evidence seal is missing")
+	}
+	reviewer, err := nestedString(final.Body, "seal", "reviewer")
+	if err != nil {
+		return err
+	}
+	if reviewer != "Reviewer-Current" {
+		return fmt.Errorf("seal reviewer = %q, expected the current-page reviewer", reviewer)
+	}
+	return nil
+}
+
+// checkConcurrentBaselineSeal races two seals carrying the same observed
+// count. Exactly one may commit; the other must be rejected.
+func checkConcurrentBaselineSeal() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1504")
+	if err != nil {
+		return err
+	}
+	successes, conflicts, err := h.race(2, func(index int) (apiResponse, error) {
+		return h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+			"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
+			"summary":  "concurrent seal attempt",
+			"baseline": 2,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent seal outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectVersion(read, 3); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "sealed" {
+		return fmt.Errorf("concurrent seal left case state = %q", state)
+	}
+	if _, err := nestedString(read.Body, "seal", "id"); err != nil {
+		return fmt.Errorf("evidence seal is missing: %w", err)
+	}
+	return nil
+}
+
+// checkConcurrentBaselineMeasurement races two technicians that both read the
+// same initial count. Only one measurement may be recorded.
+func checkConcurrentBaselineMeasurement() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1505")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	successes, conflicts, err := h.race(2, func(index int) (apiResponse, error) {
+		return h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
+			"observed":   25.2 + 0.1*float64(index),
+			"technician": fmt.Sprintf("Tech-%d", index+1),
+			"baseline":   1,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent measurement outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectVersion(read, 2); err != nil {
+		return err
+	}
+	measurements, err := nestedSlice(read.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 1 {
+		return fmt.Errorf("concurrent measurements left %d entries", len(measurements))
+	}
+	events, err := nestedSlice(read.Body, "events")
+	if err != nil {
+		return err
+	}
+	measurementEvents := 0
+	for _, entry := range events {
+		event, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if kind, _ := event["kind"].(string); kind == "measurement_accepted" || kind == "measurement_rejected" {
+			measurementEvents++
+		}
+	}
+	if measurementEvents != 1 {
+		return fmt.Errorf("concurrent measurements left %d measurement events", measurementEvents)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -514,6 +911,57 @@ func expectStatus(response apiResponse, expected int) error {
 		return fmt.Errorf("status = %d, expected %d: %s", response.Status, expected, response.Raw)
 	}
 	return nil
+}
+
+func expectVersion(response apiResponse, expected int) error {
+	value, err := nestedValue(response.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	actual, ok := value.(float64)
+	if !ok {
+		return fmt.Errorf("case.version is not a number: %v", value)
+	}
+	if int(actual) != expected {
+		return fmt.Errorf("case.version = %d, expected %d", int(actual), expected)
+	}
+	return nil
+}
+
+// race fires the same request concurrently and counts committed requests
+// (201 Created) against rejected ones (409 Conflict).
+func (h *harness) race(attempts int, fire func(index int) (apiResponse, error)) (successes int, conflicts int, err error) {
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, attempts)
+	var wait sync.WaitGroup
+	for index := 0; index < attempts; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := fire(index)
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+
+	for item := range results {
+		if item.err != nil {
+			return 0, 0, item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return 0, 0, fmt.Errorf("unexpected concurrent status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	return successes, conflicts, nil
 }
 
 func expectErrorCode(response apiResponse, expected string) error {

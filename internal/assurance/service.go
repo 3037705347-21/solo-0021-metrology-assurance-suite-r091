@@ -140,14 +140,15 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 
 func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
-	var observed domain.VerificationCase
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		observed = item
+		if err := checkSubmissionBaseline(item, input.Baseline); err != nil {
+			return err
+		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -192,30 +193,25 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		result = caseResponse(m, item)
 		return nil
 	})
-	if err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	if err := submissionBaseline(observed, input.Baseline); err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	return result, nil
+	return result, err
 }
 
 func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
-	var observed domain.VerificationCase
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		if err := checkSubmissionBaseline(item, input.Baseline); err != nil {
+			return err
+		}
 		actor := strings.TrimSpace(input.Actor)
 		reason := strings.TrimSpace(input.Reason)
 		if actor == "" || reason == "" {
 			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
-		observed = item
 		if err := item.Reopen(s.now()); err != nil {
 			return err
 		}
@@ -239,23 +235,15 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		result = caseResponse(m, item)
 		return nil
 	})
-	if err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	if err := submissionBaseline(observed, input.Baseline); err != nil {
-		return contracts.CaseResponse{}, err
-	}
-	return result, nil
+	return result, err
 }
 
-// submissionBaseline turns the watermark carried by a request into the case
-// watermark check used by the write entries.
-func submissionBaseline(observed domain.VerificationCase, submitted int) error {
-	baseline := domain.NewBaseline(submitted)
-	if err := observed.CheckBaseline(baseline); err != nil {
-		return err
-	}
-	return nil
+// checkSubmissionBaseline rejects a write whose observed handling count no
+// longer matches the case. It runs inside the repository mutation, before any
+// change, so a rejected write is discarded together with its transaction and
+// leaves no trace on the case, measurements, seal, or audit events.
+func checkSubmissionBaseline(item domain.VerificationCase, submitted int) error {
+	return item.CheckBaseline(domain.NewBaseline(submitted))
 }
 
 func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
@@ -265,6 +253,9 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		item, exists := m.Case(id)
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		if err := checkSubmissionBaseline(item, input.Baseline); err != nil {
+			return err
 		}
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)

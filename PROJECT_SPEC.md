@@ -46,24 +46,30 @@ unfinished case. A valid request creates a case in `awaiting_measurement`.
 
 ### 3. Record Measurement
 
-A technician sends `POST /cases/{id}/measurements`. The case must be
+A technician sends `POST /cases/{id}/measurements` carrying the handling
+count observed when the case page was loaded. The case must be
 `awaiting_measurement`. The service computes the signed deviation from the
 nominal value. An in-tolerance measurement moves the case to
 `review_ready`; an out-of-tolerance measurement moves it to
-`recheck_required`.
+`recheck_required`. A submission whose count no longer matches the case is
+rejected and stores no measurement.
 
 ### 4. Reopen Verification Case
 
-The steward sends `POST /cases/{id}/reopen` after an out-of-tolerance result.
-Only `recheck_required` cases may move back to `awaiting_measurement`. The
-service records the actor and reason in the audit trail.
+The steward sends `POST /cases/{id}/reopen` after an out-of-tolerance result,
+carrying the observed handling count. Only `recheck_required` cases may move
+back to `awaiting_measurement`. A submission whose count no longer matches
+the case is rejected without an audit entry. The service records the actor
+and reason in the audit trail when it succeeds.
 
 ### 5. Seal Verification
 
-The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
-`review_ready` cases may be sealed. The service selects the accepted
-measurement with the smallest absolute deviation, creates exactly one evidence
-seal, moves the case to `sealed`, and rejects later mutations.
+The verifier sends `POST /cases/{id}/seal` after an accepted measurement,
+carrying the observed handling count. Only `review_ready` cases may be
+sealed. A submission whose count no longer matches the case is rejected and
+creates no seal. The service selects the accepted measurement with the
+smallest absolute deviation, creates exactly one evidence seal, moves the
+case to `sealed`, and rejects later mutations.
 
 ## State And Rules
 
@@ -88,6 +94,13 @@ Required invariants:
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
 - A sealed case cannot accept measurements, reopen, or seal again.
+- Every case read exposes the current handling count (`version`), and each
+  successful case change increments it.
+- A measurement, reopen, or seal submission carrying a handling count must
+  match the case's current count exactly; a stale or future count is rejected
+  with a conflict and leaves no trace on the case, measurements, seal, or
+  audit events. Concurrent submissions for the same case are serialized by
+  the repository mutation lock, so at most one succeeds.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 

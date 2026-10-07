@@ -69,9 +69,11 @@ func (c VerificationCase) IsUnfinished() bool {
 	return c.State != CaseSealed
 }
 
-// Baseline is the case watermark a caller observed before submitting a change.
-// A submission that does not carry one keeps the earlier behaviour and is
-// accepted without a watermark check.
+// Baseline is the handling-count watermark a caller observed when it read the
+// case. Every successful case change increments the count, so a submission is
+// applicable only while it still matches the case exactly. A submission that
+// does not carry one keeps the earlier behaviour and is accepted without a
+// watermark check.
 type Baseline int
 
 const (
@@ -79,14 +81,14 @@ const (
 )
 
 func NewBaseline(count int) Baseline {
-	if count < 0 {
+	if count <= 0 {
 		return BaselineUnspecified
 	}
 	return Baseline(count)
 }
 
 func (b Baseline) Provided() bool {
-	return b > BaselineUnspecified
+	return b != BaselineUnspecified
 }
 
 func (b Baseline) Count() int {
@@ -104,14 +106,15 @@ func (c VerificationCase) CurrentBaseline() Baseline {
 	return Baseline(c.Version)
 }
 
-// CheckBaseline reports whether a submission may be applied to the case. The
-// check rejects a submission that references a case state the service has not
-// reached yet and accepts everything else.
+// CheckBaseline reports whether a submission may be applied to the case. A
+// submission carrying an observed count must match the current count exactly:
+// both an older count (someone else advanced the case in the meantime) and a
+// newer one are rejected, so no stale write can be applied.
 func (c VerificationCase) CheckBaseline(baseline Baseline) error {
 	if !baseline.Provided() {
 		return nil
 	}
-	if baseline.Count() > c.Version {
+	if baseline.Count() != c.Version {
 		return fmt.Errorf(
 			"%w: submission carries %s but the case is at %d",
 			ErrStateConflict,
